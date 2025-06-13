@@ -1,0 +1,1035 @@
+#include <stdint.h>
+#include <stm32f051x8.h>
+#include <math.h>
+
+//Configurar pines/cloc´s/timers
+void GPIOx();
+void TIMx();
+void PWMx();
+void configurarPinesMotores();
+void configurarPinesBotones();
+void configurarPinesLeds();
+
+//Modos de operación
+void modoEspera();
+void controlAutonomo();
+void controlManual();
+void controlManualDOS();
+void compararModo();
+
+//Protocolos del modo manual
+void movAdelante();
+void movAtras();
+void movDerecha();
+void movIzquierda();
+void stop();
+
+//Comunicación bluetooth y toma de datos
+void UART1_Init(void);
+void leerDato();
+void asignarEstadoPiston();
+void asignarModo();
+void asignarRX();
+void asignarVelocidad();
+void asignarVelocidadAngular();
+
+//Calculo de velocidad
+void ecuacionesVelocidad();
+
+//Piston
+void controlPiston();
+
+//Protocolos de seguridad
+void paradoEmergenciaPorSensor();
+void paradoEmerjenciaManual();
+void paradoEmerjenciaManualDOS();
+
+//Luces indicadoras
+void luzEspera();
+void luzMovimiento();
+void luzParadoEmerjencia();
+
+//====>SENSORES
+//Sensores Ultrasonicos
+
+//Sensores seguidores de línea
+
+//Extra
+void delay_ms(uint32_t ms);
+
+//Variables globales
+uint8_t mode=0;
+uint8_t dummy=0;
+char dato;
+char posicionPiston;
+int estadoPiston=0;
+int estadoAGV;
+char direccion;
+char letraVelocidad='H';
+char letraVelocidadAngular='W';
+char modo='P';
+char guardarModo='P';
+char newModo='P';
+char oldModo='P';
+int velocidad;
+int velocidadAngular;
+
+/*
+void calcularPorcentajes(int x1, int x2, float *y1, float *z1, float *y2, float *z2) {
+    *y1 = x1 * 0.75f;  // 75% de x
+    *z1 = x1 * 0.50f;  // 50% de x
+    *y2 = x2 * 0.75f;  // 75% de x
+    *z2 = x2 * 0.50f;  // 50% de x
+}
+*/
+
+//Ecuaciones
+float V_req;  	// Velocidad lineal deseada
+float W_req; 	// Velocidad angular deseada
+float w_r;    	// Velocidad angular rueda derecha
+float w_l;    	// Velocidad angular rueda izquierda
+
+float R = 0.10;   	// Radio de las ruedas (m)
+float L = 0.48; // Distancia entre ruedas (m)
+
+int duty_r;
+int duty_l;
+
+/* ---------- Definiciones de pines ---------- */
+#define LED_PORT GPIOC
+
+/* ---------- Variables globales ---------- */
+volatile uint32_t echo1_start=0, echo1_end=0;
+volatile uint32_t echo2_start=0, echo2_end=0;
+volatile uint32_t echo3_start=0, echo3_end=0;
+volatile uint32_t echo4_start=0, echo4_end=0;
+volatile float    distance1_cm = 0.0f, distance2_cm = 0.0f, distance3_cm = 0.0f, distance4_cm = 0.0f;
+volatile uint8_t  measurement_done = 0;
+
+/* ---------- Prototipos de funciones ---------- */
+static void HCSR04_Init(void);
+static void TIM6_Init(void);
+static void TIM14_Init(void);
+static void EXTI_Init(void);
+static void US_Trigger(uint8_t id);
+
+int main(void)
+{
+	GPIOx();
+	TIMx();
+	PWMx();
+	configurarPinesMotores();
+	configurarPinesBotones();
+    configurarPinesLeds();
+    UART1_Init();
+    HCSR04_Init();   /* configura GPIO-A, TIM6, TIM14, EXTI  */
+
+    while (1)
+    {
+		switch (modo)
+		{
+			case 'P':	// Pausa
+				luzEspera();
+				modoEspera();
+				controlPiston();
+				estadoAGV=0;
+				break;
+
+			case 'M':	// Modo Manual (8.4.6)
+				if(estadoAGV==0 || estadoAGV==1){
+					luzMovimiento();
+					controlManualDOS();
+					paradoEmerjenciaManualDOS();
+					estadoAGV=1;
+					break;
+				}else{
+					modo='P';
+					break;
+				}
+
+			case 'A':	// Modo automático
+				if(estadoAGV==0 || estadoAGV==2){
+					luzMovimiento();
+					controlAutonomo();
+					paradoEmerjenciaManualDOS();
+					estadoAGV=2;
+				}else{
+					modo='P';
+					break;
+				}
+				break;
+
+			default:
+				break;
+		}
+    	leerDato();
+    	asignarModo();
+    }
+}
+
+void GPIOx(){
+	RCC->AHBENR|=0x00080000; 	//Activamos el GPIO C clock.   (Bit 19)(6.4.6)
+	RCC->AHBENR|=0x00020000; 	//Activamos el GPIO A clock.   (Bit 17)
+	RCC->AHBENR |= 0x00040000;  // GPIOBEN
+}
+
+void TIMx(){
+	RCC->APB1ENR |= 0x00000002;					//Enciende el temporizador TIM3 (Bit 1) (6.4.8)
+	RCC->APB2ENR |= RCC_APB2ENR_TIM15EN;
+}
+
+void PWMx(){
+    TIM3->PSC = 47;								// Prescaler (8MHz / (7+1)) =  1MHz timer clock
+    TIM3->ARR = 100;  							// Auto-reload
+
+    //===========================
+    TIM15->PSC  = 47;     /* 48 MHz / (47+1) = 1 MHz */
+    TIM15->ARR  = 100;    /* 1 kHz  (ARR+1 cuentas) */
+    /* PWM1 en CH1 y CH2 + preload */
+    // Configurar CH1 y CH2 en modo PWM1 (OCxM = 110), salida habilitada (OCxPE = 1)
+    TIM15->CCMR1 &= ~(TIM_CCMR1_OC1M | TIM_CCMR1_OC2M);  // limpiar bits
+    TIM15->CCMR1 |= (6 << TIM_CCMR1_OC1M_Pos) | (6 << TIM_CCMR1_OC2M_Pos);  // PWM mode 1
+    TIM15->CCMR1 |= TIM_CCMR1_OC1PE | TIM_CCMR1_OC2PE;   // Preload enable
+
+    /* Habilitar salidas */
+    TIM15->CCER  |= TIM_CCER_CC1E | TIM_CCER_CC2E;
+
+    /* Cargar duty inicial (0 %) */
+    //TIM15->CCR1 = 0;
+    //TIM15->CCR2 = 0;
+
+    /* después de configurar CCER … */
+    TIM15->BDTR |= TIM_BDTR_MOE;       /* <-- HABILITA la salida física        */
+
+    TIM15->CR1  |= TIM_CR1_ARPE; /* auto-reload preload */
+    TIM15->CR1  |= TIM_CR1_CEN;  /* contador en marcha */
+    //===================
+
+    // Canal 1 - PC6
+    TIM3->CCMR1 |= (6 << 4);   // OC1M: PWM1 (110)
+    TIM3->CCMR1 |= (1 << 3);   // OC1PE: preload enable
+
+    // Canal 2 - PC7
+    TIM3->CCMR1 |= (6 << 12);  // OC2M: PWM1
+    TIM3->CCMR1 |= (1 << 11);  // OC2PE
+
+	TIM3->CCMR2 &= ~(0x00007000 | 0x00007000); 	// Limpiamos OC3M y OC4M
+	TIM3->CCMR2 |= 0x00000060 | 0x00006000;  	// PWM Mode 1 para CH3 y CH4
+    TIM3->CCMR2 |= 0x00000800 | 0x08000000; 	// Habilitad preload
+
+    TIM3->CCER |= TIM_CCER_CC1E;  // Habilitar salida canal 1 (PC6)
+    TIM3->CCER |= TIM_CCER_CC2E;  // Habilitar salida canal 2 (PC7)
+	TIM3->CCER  |=  0x00000100 | 0x00001000;   	// CC3E y CC4E [Capture/Compare Enable Register]
+
+	TIM3->CR1   |=  0x00000080;                	// ARPE Esto hace que nuestro cotador se repita ua vez que llegó a su maximo valor
+	TIM3->CR1   |=  0x00000001;                	// CEN Esto enciende el TIM3, sin esto este no funcionara apesar de que lo configuremos
+
+}
+
+void configurarPinesMotores(){
+	/*
+	 * PC8[Motor izquierdo] CH3 - AF para TIM3
+	 * PC9[Motor derecho]   CH4 - AF para TIM3
+	 *
+	 * PC7[Motor izquierdo] CH2 - AF para TIM3
+	 * PC6[Motor derecho]   CH1 - AF para TIM3
+	 *
+	 * PA2[Pistón arriva]			CH2 - AF para TIM15
+	 * PA3[Pistón abajo]			CH3 - AF para TIM15
+	 */
+    GPIOC->MODER &= ~(0x00030000 | 0x000C0000); // limpiar MODER
+    GPIOC->MODER |=  (0x00020000 | 0x00080000); // configurar MODER (8.4.1)
+    GPIOC->AFR[1] &= ~(0x000000FF); 			// limpiar los bits de PC8 y PC9 para AF TIM3
+    GPIOC->AFR[1] |=  (0x00000022);             // AF2 para PC8 (bits 0-3) y PC9 (bits 4-7)
+
+    GPIOC->MODER &= ~(0x00003000 | 0x0000C000); // limpiar MODER
+    GPIOC->MODER |=  (0x00002000 | 0x00008000); // configurar MODER (8.4.1)
+    GPIOC->AFR[0] &= ~(0xFF000000);             // limpiar los bits de PC6 y PC7 para AF TIM3
+    GPIOC->AFR[0] |=  (0x22000000);             // AF2 para PC6 (bits 24-27) y PC7 (bits 28-31)
+
+    /* ===  TIM15_CH1 (PB14) y TIM15_CH2 (PB15) ===================== */
+    /* 1) Modo Alternate Function */
+    GPIOB->MODER &= ~((3U << (14 * 2)) | (3U << (15 * 2))); /* limpiar */
+    GPIOB->MODER |=  ((2U << (14 * 2)) | (2U << (15 * 2))); /* AF */
+    /* 2) AF1 para TIM15  (pines PB14/B15 están en AFR[1])       */
+    GPIOB->AFR[1] &= ~((0xF << ((14 - 8) * 4)) | (0xF << ((15 - 8) * 4)));
+    GPIOB->AFR[1] |=  ((0x1 << ((14 - 8) * 4)) | (0x1 << ((15 - 8) * 4)));
+}
+
+void configurarPinesBotones(){
+    /*
+     * PA8 [Modo Espera]
+     */
+    GPIOA->MODER &= ~0x00030000; // limpiar MODER
+    GPIOA->PUPDR &= ~0x00030000; // limpiar PUPDR
+    GPIOA->PUPDR |=  0x00010000; // configurar PUPDR
+}
+
+void configurarPinesLeds(){
+    /*
+     * PC12[led que inidica modo espera]
+     * PC11[led que indica modo automático-manual]
+     * PC10[led que indica parado de emerjencia]
+     */
+	GPIOC->MODER &= ~0x03F00000; // limpiar MODER
+	GPIOC->MODER |=  0x01500000; // configurar MODER
+}
+
+void modoEspera(){
+	stop();
+}
+
+void controlAutonomo(){
+    /* ­­­LED ON si cualquiera < 30 cm ­­­*/
+	leerDato();
+
+    if (measurement_done)
+    {
+        measurement_done = 0;
+
+        /* Enciende el LED si cualquiera de las distancias es menor a 30 cm */
+        if (distance1_cm < 30.0f || distance2_cm < 30.0f || distance3_cm < 30.0f || distance4_cm < 30.0f){
+        	luzParadoEmerjencia();
+        	stop();
+        }
+        else{
+    		TIM3->CCR3 = 10;
+    		TIM3->CCR4 = 10;
+        }
+    }
+}
+
+void controlManual(){
+	direccion=0;
+	velocidad=30;
+	do{
+		leerDato();
+		asignarRX();
+		asignarVelocidad();
+		asignarVelocidadAngular();
+		asignarModo();
+		paradoEmerjenciaManual();
+		switch (direccion)
+		{
+			case 'F':	// adelante (8.4.6)
+				movAdelante();
+				break;
+
+			case 'B':	// atras
+				movAtras();
+				break;
+
+			case 'R':	// derecha
+				movDerecha();
+				break;
+
+			case 'L':	// izquierda
+				movIzquierda();
+				break;
+
+			case 'S':	// stop
+				stop();
+				break;
+
+			default:
+				break;
+		}
+	}while(modo!='P' && modo!='W');
+}
+
+void controlManualDOS(){
+
+	leerDato();
+	asignarVelocidad();
+	asignarVelocidadAngular();
+
+    if (measurement_done)
+    {
+        measurement_done = 0;
+        ecuacionesVelocidad();
+    }
+}
+
+void compararModo(){
+	/*
+	 * modo=a
+	 * guardarModo=a
+	 * newModo=a
+	 * oldModo=a
+	 *
+	 * 		guardarModo[a]	=	modo[a]
+	 * if 	guardarModo[a] 	!=	newModo[a] 		(oldModo[a]	newModo[a])
+	 *
+	 * 		guardarModo[b]	 =	modo[b]
+	 * if 	guardarModo[b] 	!=	newModo[a] 		(oldModo[a]	newModo[a])
+	 * 		oldModo[a]		 =	newModo[a]		(oldModo[a]	newModo[a])
+	 * 		newModo[a]		 =	guardarModo[b]	(oldModo[a]	newModo[b])
+	 *
+	 * 		guardarModo[c]	 =	modo[c]
+	 * if	guardarModo[c]	!=	newModo[b]		(oldModo[a]	newModo[b])
+	 * 		oldModo[a]		 =	newModo[b]		(oldModo[b]	newModo[b])
+	 * 		newModo[b]		 =	guardarModo[c]	(oldModo[b]	newModo[c])
+	 *
+	 * 		guardarModo[c]	 =	modo[c]
+	 * if	guardarModo[c]	!=	newModo[c]		(oldModo[a]	newModo[b])
+	 */
+
+	guardarModo=modo;
+	if(guardarModo != newModo){
+		oldModo = newModo;
+		newModo = guardarModo;
+	}
+}
+
+//===> Protocolos del modo manual <==================================================================================
+
+void movAdelante(){
+	TIM3->CCR3 = duty_r;	// Canal 3 -> Motor A
+	TIM3->CCR4 = duty_l; 	// Canal 4 -> Motor B
+	TIM3->CCR2 = 0;  		// Canal 4 -> Motor B
+    TIM3->CCR1 = 0;		// Canal 3 -> Motor A
+}
+
+void movAtras(){
+	TIM3->CCR3 = 0;	// Canal 3 -> Motor A
+	TIM3->CCR4 = 0; 	// Canal 4 -> Motor B
+	TIM3->CCR2 = duty_r;  		// Canal 4 -> Motor B
+    TIM3->CCR1 = duty_l;		// Canal 3 -> Motor A
+}
+
+/*
+void movDerecha(){
+	TIM3->CCR3 = duty_r;	// Canal 3 -> Motor A
+	TIM3->CCR4 = duty_l; 	// Canal 4 -> Motor B
+    TIM3->CCR1 = 0;			// Canal 3 -> Motor A
+    TIM3->CCR2 = 0;  		// Canal 4 -> Motor B
+}
+
+void movIzquierda(){
+	TIM3->CCR3 = duty_r;	// Canal 3 -> Motor A
+	TIM3->CCR4 = duty_l; 	// Canal 4 -> Motor B
+    TIM3->CCR1 = 0;			// Canal 3 -> Motor A
+    TIM3->CCR2 = 0;  		// Canal 4 -> Motor B
+}
+*/
+
+void stop(){
+	TIM3->CCR3 = 0;			// Canal 3 -> Motor A
+	TIM3->CCR4 = 0; 		// Canal 4 -> Motor B
+    TIM3->CCR1 = 0;			// Canal 3 -> Motor A
+    TIM3->CCR2 = 0;  		// Canal 4 -> Motor B
+}
+
+//===> Comunicación bluetooth y toma de datos <=======================================================================
+void UART1_Init(void){
+	// Habilita reloj para GPIOA y USART1
+	RCC->AHBENR |= (1 << 17); // GPIOAEN
+	RCC->APB2ENR |= (1 << 14); // USART1EN
+
+	// PA9 (TX) y PA10 (RX) en modo alterno (AF1)
+	GPIOA->MODER |= (0b10 << (9 * 2)) | (0b10 << (10 * 2));
+	GPIOA->AFR[1] |= (0b0001 << 4) | (0b0001 << 8); // AF1 para PA9 y PA10
+
+	USART1->BRR = 833; // 8 MHz / 9600 baudios
+
+	USART1->CR1 |= (1 << 2); // RE (habilita recepción)
+	USART1->CR1 |= (1 << 0); // UE (habilita USART)
+}
+
+void leerDato(){
+	if (USART1->ISR & USART_ISR_RXNE)
+	{
+		dato = USART1->RDR;
+		delay_ms(50);
+
+	}
+}
+
+void asignarEstadoPiston(){
+	if(dato == 'B' || dato == 'F')
+	{
+		posicionPiston = dato;
+	}
+}
+
+void asignarModo(){
+	if(dato == 'A' || dato == 'M' || dato == 'P')
+	{
+		modo = dato;
+		compararModo();
+	}
+}
+
+void asignarRX(){
+	if(dato == 'F' || dato == 'B' || dato == 'R' || dato == 'L' || dato == 'S')
+	{
+		direccion = dato;
+	}
+}
+
+void asignarVelocidad(){
+	//if(dato != 'A' || dato != 'M' || dato != 'P' || dato != 'F' || dato != 'B' || dato != 'R' || dato != 'L' || dato != 'S')
+	if(dato == 'C' || dato == 'D' || dato == 'E' || dato == 'G' || dato == 'H' || dato == 'I' || dato == 'J' || dato == 'K' || dato == 'N')
+	{
+		letraVelocidad = dato;
+
+		switch (letraVelocidad)
+		{
+		case 'C':
+			velocidad=30;
+			break;
+		case 'D':
+			velocidad=35;
+			break;
+		case 'E':
+			velocidad=40;
+			break;
+		case 'G':
+			velocidad=45;
+			break;
+		case 'H':
+			velocidad=50;
+			break;
+		case 'I':
+			velocidad=55;
+			break;
+		case 'J':
+			velocidad=60;
+			break;
+		case 'K':
+			velocidad=65;
+			break;
+		case 'N':
+			velocidad=70;
+			break;
+
+		default:
+			break;
+		}
+		delay_ms(20);
+
+	}
+}
+
+void asignarVelocidadAngular(){
+	//if(dato != 'A' || dato != 'M' || dato != 'P' || dato != 'F' || dato != 'B' || dato != 'R' || dato != 'L' || dato != 'S')
+	if(dato == 'O' || dato == 'Q' || dato == 'T' || dato == 'U' || dato == 'V' || dato == 'W' || dato == 'X' || dato == 'Y' || dato == 'Z')
+	{
+		letraVelocidadAngular = dato;
+
+		switch (letraVelocidadAngular)
+		{
+		case 'O':
+			velocidadAngular=40;
+			break;
+		case 'Q':
+			velocidadAngular=45;
+			break;
+		case 'T':
+			velocidadAngular=40;
+			break;
+		case 'U':
+			velocidadAngular=45;
+			break;
+		case 'V':
+			velocidadAngular=50;
+			break;
+		case 'W':
+			velocidadAngular=55;
+			break;
+		case 'X':
+			velocidadAngular=60;
+			break;
+		case 'Y':
+			velocidadAngular=65;
+			break;
+		case 'Z':
+			velocidadAngular=70;
+			break;
+
+			default:
+				break;
+		}
+		delay_ms(20);
+	}
+}
+
+//===> Calculo de velocidad <=====================================================================================
+void ecuacionesVelocidad(){
+	V_req = (((velocidad-5.0)/95.0)*2.0-1.0);
+	W_req = (((velocidadAngular-5.0)/95.0)*2.0-1.0);
+
+	w_r = V_req / R + (L * W_req) / (2.0 * R);
+	w_l = V_req / R - (L * W_req) / (2.0 * R);
+
+	float max_w = 100.0;
+   duty_r = fmin(fabs(w_r), max_w) / max_w * 1000.0;
+   duty_l = fmin(fabs(w_l), max_w) / max_w * 1000.0;
+
+   /*
+   float duty_r_75;
+   float duty_l_75;
+
+   float duty_r_50;
+   float duty_l_50;
+   */
+
+   if(V_req>0 && letraVelocidad !='H'){ //Adelante
+	   	movAdelante();
+	   	if(distance1_cm < 30.0f || distance2_cm < 30.0f || distance3_cm < 30.0f){
+	   		//calcularPorcentajes(duty_r, duty_l, &duty_r_75, &duty_l_75, &duty_r_50, &duty_l_50);
+	   		stop();
+	   	}
+   }
+   else if (V_req<0 && letraVelocidad !='H'){ //atras
+	   movAtras();
+	   	if(distance4_cm < 30.0f){
+	   		stop();
+	   	}
+   }
+   else{
+	   stop();
+    }
+
+   delay_ms(20);
+}
+
+//===> Control del Piston <=====================================================================================
+void controlPiston(){
+	asignarEstadoPiston();
+	if(posicionPiston=='F' && estadoPiston==0)
+	{
+	    TIM15->CCR1 = 100;
+		estadoPiston=1;
+		delay_ms(300);
+		TIM15->CCR1 = 0;
+	}
+	else if(posicionPiston=='B' && estadoPiston==1)
+	{
+		TIM15->CCR2 = 100;
+		estadoPiston=0;
+		delay_ms(300);
+		TIM15->CCR2 = 0;
+	}
+}
+
+//===> Protocolos de seguridad <=====================================================================================
+/*
+void paradoEmergenciaPorSensor(){
+	medirDistancia_cm();
+    uint32_t distancia = medirDistancia_cm();
+    if (distancia > 0 && distancia <= 20){
+    	stop();
+    	luzParadoEmerjencia();
+    }
+}
+*/
+
+void paradoEmerjenciaManual(){
+    /*
+     * PA8 [Parado de emerjencia manual]
+     */
+
+	if(!(GPIOA->IDR & 0x00000100))
+	{
+		mode=3;
+		modo='W';
+		luzParadoEmerjencia();
+		stop();
+		delay_ms(100); //Esto es para que la STM no confunda el click de "parado de emerjencia" con el click de "liberar parado de emerjencia", ya que son el mismo boton
+
+		while(modo=='W')
+		{
+			if(!(GPIOA->IDR & 0x00000100))
+			{
+				mode=0;
+				modo='P';
+				dummy=1;
+				delay_ms(50);
+			}
+		}
+	}
+}
+
+void paradoEmerjenciaManualDOS(){
+    /*
+     * PA8 [Parado de emerjencia manual]
+     */
+	if(!(GPIOA->IDR & 0x00000100)){
+		while(!(GPIOA->IDR & 0x00000100))
+		{
+			luzParadoEmerjencia();
+			modo='W';
+			stop();
+			delay_ms(100); //Esto es para que la STM no confunda el click de "parado de emerjencia" con el click de "liberar parado de emerjencia", ya que son el mismo boton
+		}
+
+	}
+}
+
+//===> Luces indicadoras <=============================================================================================
+void luzEspera(){
+    /*
+     * PC12 [led que inidica modo espera]
+     */
+	GPIOC->ODR &= ~  (0x00001000);	//Prender luz espera
+	GPIOC->ODR |=(0x00000C00); 	//apagar demas leds
+}
+
+void luzMovimiento(){
+    /*
+     * PC11 [led que indica modo automático-manual]
+     */
+	GPIOC->ODR &=~(0x00000800); 	//Prender luz indicadora
+	GPIOC->ODR |= (0x00001400);	//apagar demas leds
+}
+
+void luzParadoEmerjencia(){
+    /*
+     * PC10 [led que indica parado de emerjencia]
+     */
+	GPIOC->ODR &=~  (0x00000400); 	//Prender luz indicadora
+	GPIOC->ODR |= (0x00001800);	//apagar demas leds
+}
+
+//===> Sensores seguidores de línea <==================================================================================
+
+
+//===> Extra <========================================================================================================
+void delay_ms(uint32_t ms){
+	/* Función de retardo simple (bloqueante) */
+    SysTick->LOAD = (48000 - 1); // 1ms (48MHz/48000 = 1kHz)
+    SysTick->VAL = 0;
+    SysTick->CTRL = SysTick_CTRL_CLKSOURCE_Msk | SysTick_CTRL_ENABLE_Msk;
+
+    for(uint32_t i = 0; i < ms; i++)
+    {
+        while(!(SysTick->CTRL & SysTick_CTRL_COUNTFLAG_Msk));
+    }
+    SysTick->CTRL = 0;
+}
+
+//===> Sensores Ultrasonicos <=======================================================================================
+/* =============== Inicialización general =============== */
+static void HCSR04_Init(void)
+{
+    /* Habilita los relojes para GPIOA, GPIOC, TIM6 y TIM14 */
+    RCC->AHBENR  |= RCC_AHBENR_GPIOAEN  | RCC_AHBENR_GPIOCEN;
+    RCC->APB1ENR |= RCC_APB1ENR_TIM6EN  | RCC_APB1ENR_TIM14EN;
+
+    /* Sensor 1: PA5 (TRIG1) como salida, PA6 (ECHO1) como entrada con pull-down */
+    GPIOA->MODER |=  (1 << (5*2));          /* PA5 salida */
+    GPIOA->MODER &= ~(3 << (6*2));          /* PA6 entrada */
+    GPIOA->PUPDR |=  (2 << (6*2));          /* Pull-down */
+
+    /* Sensor 2: PA7 (TRIG2) como salida, PA1 (ECHO2) como entrada con pull-down */
+    GPIOA->MODER |=  (1 << (7*2));          /* PA7 salida */
+    GPIOA->MODER &= ~(3 << (1*2));          /* PA1 entrada */
+    GPIOA->PUPDR |=  (2 << (1*2));          /* Pull-down */
+
+    /* Sensor 3: PA2 (TRIG3) como salida, PA3 (ECHO3) como entrada con pull-down */
+    GPIOA->MODER |=  (1 << (2*2));          /* PA2 salida */
+    GPIOA->MODER &= ~(3 << (3*2));          /* PA3 entrada */
+    GPIOA->PUPDR |=  (2 << (3*2));          /* Pull-down */
+
+    /* Sensor 4: PA4 (TRIG4) como salida, PA0 (ECHO4) como entrada con pull-down */
+    GPIOA->MODER |=  (1 << (4*2));          /* PA4 salida */
+    GPIOA->MODER &= ~(3 << (0*2));          /* PA0 entrada */
+    GPIOA->PUPDR |=  (2 << (0*2));          /* Pull-down */
+
+    TIM6_Init();
+    TIM14_Init();
+    EXTI_Init();
+}
+
+/* ================= TIM6: cronómetro 1 µs ================= */
+static void TIM6_Init(void)
+{
+    /* Configura TIM6 para contar a 1 MHz (1 µs por cuenta) */
+    TIM6->PSC = 8 - 1;
+    TIM6->ARR = 0xFFFF;
+    TIM6->CR1 |= TIM_CR1_CEN;            /* Inicia el contador */
+}
+
+/* ================ TIM14: disparo cada 10 ms =============== */
+static void TIM14_Init(void)
+{
+    TIM14->PSC = 48 - 1;          /* 48 MHz / 48 = 1 MHz */
+    TIM14->ARR = 10000 - 1;       /* 10 000 µs = 10 ms */
+    TIM14->DIER |= TIM_DIER_UIE;
+    TIM14->CR1  |= TIM_CR1_CEN;
+    NVIC_EnableIRQ(TIM14_IRQn);
+}
+
+/* =================== EXTI para PA0, PA1, PA3 y PA6 ================= */
+static void EXTI_Init(void)
+{
+    /* Configura EXTI0 para PA0 (ECHO4) */
+    SYSCFG->EXTICR[0] |= SYSCFG_EXTICR1_EXTI0_PA;
+
+    /* Configura EXTI6 para PA6 (ECHO1) */
+    SYSCFG->EXTICR[1] |= SYSCFG_EXTICR2_EXTI6_PA;
+
+    /* Configura EXTI1 para PA1 (ECHO2) */
+    SYSCFG->EXTICR[0] |= SYSCFG_EXTICR1_EXTI1_PA;
+
+    /* Configura EXTI3 para PA3 (ECHO3) */
+    SYSCFG->EXTICR[0] |= SYSCFG_EXTICR1_EXTI3_PA;
+
+    /* Habilita interrupciones para EXTI0, EXTI1, EXTI3 y EXTI6 */
+    EXTI->IMR  |= (1<<0) | (1<<1) | (1<<3) | (1<<6);
+    EXTI->RTSR |= (1<<0) | (1<<1) | (1<<3) | (1<<6);   /* Flanco de subida */
+    EXTI->FTSR |= (1<<0) | (1<<1) | (1<<3) | (1<<6);   /* Flanco de bajada */
+
+    NVIC_EnableIRQ(EXTI0_1_IRQn);    /* PA0 y PA1 */
+    NVIC_EnableIRQ(EXTI2_3_IRQn);    /* PA3 */
+    NVIC_EnableIRQ(EXTI4_15_IRQn);   /* PA6 */
+}
+
+/* ============== Pulso de 10 µs en el TRIG ============== */
+static void US_Trigger(uint8_t id)
+{
+    uint32_t mask;
+    switch(id){
+        case 1: mask = (1U<<5); break;  /* PA5 */
+        case 2: mask = (1U<<7); break;  /* PA7 */
+        case 3: mask = (1U<<2); break;  /* PA2 */
+        case 4: mask = (1U<<4); break;  /* PA4 */
+        default: return;
+    }
+
+    GPIOA->BSRR = mask;            /* HIGH */
+    TIM6->CNT = 0;
+    while (TIM6->CNT < 10);        /* 10 µs */
+    GPIOA->BRR  = mask;            /* LOW  */
+}
+
+/* ======= ISR EXTI0_1 (PA0 - Sensor 4 y PA1 - Sensor 2) ======= */
+void EXTI0_1_IRQHandler(void)
+{
+    /* Manejo del sensor 4 (PA0) */
+    if (EXTI->PR & (1<<0))
+    {
+        EXTI->PR |= (1<<0);
+        if (GPIOA->IDR & (1<<0))               /* Flanco de subida */
+            echo4_start = TIM6->CNT;
+        else {                                 /* Flanco de bajada */
+            echo4_end = TIM6->CNT;
+            uint32_t dt = (echo4_end>=echo4_start)?
+                           (echo4_end-echo4_start)
+                         : (0x10000-echo4_start+echo4_end);
+            distance4_cm = (dt*0.0343f)/2.0f;
+            measurement_done = 1;
+        }
+    }
+
+    /* Manejo del sensor 2 (PA1) - igual que antes */
+    if (EXTI->PR & (1<<1))
+    {
+        EXTI->PR |= (1<<1);
+        if (GPIOA->IDR & (1<<1))               /* Flanco de subida */
+            echo2_start = TIM6->CNT;
+        else {                                 /* Flanco de bajada */
+            echo2_end = TIM6->CNT;
+            uint32_t dt = (echo2_end>=echo2_start)?
+                           (echo2_end-echo2_start)
+                         : (0x10000-echo2_start+echo2_end);
+            distance2_cm = (dt*0.0343f)/2.0f;
+            measurement_done = 1;
+        }
+    }
+}
+
+/* ======= ISR EXTI2_3  (PA3 – Sensor 3) ======= */
+void EXTI2_3_IRQHandler(void)
+{
+    if (EXTI->PR & (1<<3))
+    {
+        EXTI->PR |= (1<<3);
+        if (GPIOA->IDR & (1<<3))               /* Flanco de subida */
+            echo3_start = TIM6->CNT;
+        else {                                 /* Flanco de bajada */
+            echo3_end = TIM6->CNT;
+            uint32_t dt = (echo3_end>=echo3_start)?
+                           (echo3_end-echo3_start)
+                         : (0x10000-echo3_start+echo3_end);
+            distance3_cm = (dt*0.0343f)/2.0f;
+            measurement_done = 1;
+        }
+    }
+}
+
+/* ======= ISR EXTI4_15  (PA6 – Sensor 1) ======= */
+void EXTI4_15_IRQHandler(void)
+{
+    if (EXTI->PR & (1<<6))
+    {
+        EXTI->PR |= (1<<6);
+        if (GPIOA->IDR & (1<<6))               /* Flanco de subida */
+            echo1_start = TIM6->CNT;
+        else {                                 /* Flanco de bajada */
+            echo1_end = TIM6->CNT;
+            uint32_t dt = (echo1_end>=echo1_start)?
+                           (echo1_end-echo1_start)
+                         : (0x10000-echo1_start+echo1_end);
+            distance1_cm = (dt*0.0343f)/2.0f;
+            measurement_done = 1;
+        }
+    }
+}
+
+/* ======= ISR TIM14 – alterna sensores cada 10 ms ======= */
+void TIM14_IRQHandler(void)
+{
+    static uint8_t current = 1;
+    if (TIM14->SR & TIM_SR_UIF)
+    {
+        TIM14->SR &= ~TIM_SR_UIF;
+        US_Trigger(current);
+        current = (current==4)? 1 : current+1;  /* Ahora tenemos 4 sensores */
+    }
+}
+
+/*
+ * #include <stdint.h>
+#include <stm32f051x8.h>
+#include <math.h>
+
+// Parámetros del robot
+float R = 0.1;   // Radio de las ruedas (m)
+float L = 0.45;  // Distancia entre ruedas (m) (No son las correctas)
+
+// Velocidades PWM	(Lo ideal seria que estuvieran en m/s pero aun no tenemos el dato para tenerlo)
+int VELOCIDAD_BASE = 50;	//Deberia ser 1m/s
+
+// Ganancia PID
+float Kp = 15.0;  // Ajusta la ganancia del proporcional
+float ki = 0.5;	// ganancia del integral
+float kd = 8.0;	// ganancia del derivativo
+
+// === Variables PID ===
+int error_anterior = 0;
+float error_integral = 0;
+
+// === Delay simple ===
+void delay_ms(int ms) {
+    for (int i = 0; i < ms * 1000; ++i)
+        __asm("nop");
+}
+
+// === Inicialización de sensores (PB1, PB10 a PB12, PC0 a PC3 como entrada) ===
+void sensores_Init(void) {
+	RCC ->AHBENR |= 0x000C0000;	//Activamos el GPIOB y el GPIOC. (6.4.6)
+
+	//Habilitamos los pines como entrada(8.4.1)
+    GPIOB->MODER  &= ~(0x03F0000C);
+    GPIOC->MODER  &= ~(0x000000FF);
+}
+
+// === Leer sensores y calcular error proporcional ===
+int leerError(void) {
+    int pesos[8] = {-3, -2, -1, -0.5, 0.5, 1, 2, 3};  //Puedes ajustar los pesos para decidir que tanto afecta el que un sensor detecte la linea. (Necesario probar)
+    int suma = 0;
+    int cuenta = 0;
+
+    // Leer sensores en GPIOB: PB1, PB10, PB11, PB12
+    if (!(GPIOB->IDR & (1 << 1))) {  // PB1 - S0
+        suma += pesos[0] * 100;
+        cuenta++;
+    }
+    if (!(GPIOB->IDR & (1 << 10))) {  // PB10 - S1
+        suma += pesos[1] * 100;
+        cuenta++;
+    }
+    if (!(GPIOB->IDR & (1 << 11))) {  // PB11 - S2
+        suma += pesos[2] * 100;
+        cuenta++;
+    }
+    if (!(GPIOB->IDR & (1 << 12))) {  // PB12 - S3
+        suma += pesos[3] * 100;
+        cuenta++;
+    }
+
+    // Leer sensores en GPIOC: PC0 a PC3
+    for (int i = 0; i < 4; i++) {
+        if (!(GPIOC->IDR & (1 << i))) {  // PC0-PC3 -> S4-S7. // Línea negra activa el sensor (LOW) revisar si el sensor funciona asi o al revez, en tal caso quitar el signo de exclamacion .Guarda informacion(8.4.5)
+            suma += pesos[i + 4] * 100;	// multiplicamos por 100 para evitar float
+            cuenta++;
+        }
+    }
+
+    if (cuenta == 0)
+        return 0;  // No hay línea detectada. Si aplica agregar un la opccion de que se detenga el AGV.
+
+    return suma / cuenta;	// Retorna error ponderado. Valor entre -300 y 300.
+}
+
+// === PWM usando TIM3 CH1 (PA6) y CH2 (PA7) ===
+void PWM_Init(void) {
+	GPIOA->AFR[0] |= 0x11000000; // AF1 para TIM3
+
+    RCC->APB1ENR |= 0x00000002;	//Habilita el TIM3. (6.4.8)
+    TIM3->PSC = 7;     // Prescaler (8MHz / (7+1 MHZ)) = 1 MHz timer clock. Ponemos un preescaler, esto es dividir el numero de frecuencia del reloj en 8, para obtener 1 MHz (19.4.9)
+    TIM3->ARR = 1000;   // Auto-reload = 1000 counts -> 1kHz PWM frequency. Este valor determina el período del temporizador. El contador contará desde 0 hasta 1000 Micro segundos antes de reiniciarse.(19.4.10)
+
+    TIM3->CCR1 = 0;      // Duty derecho
+    TIM3->CCR2 = 0;      // Duty izquierdo
+
+    TIM3->CCMR1 |= 0x6060; // PWM Mode 1 para CH1 y CH2. Ponemos el modo en el que esta, en este caso en comparacion.(18.4.7)
+    TIM3->CCER |= 0x0011;	// CC1E y CC2E. Habilitamos el comparador. (18.4.9)
+    TIM3->CR1 |= 0x0001;	// Habilitar contador (18.4.1)
+}
+
+// === Pines para dirección de motores: PC8 y PC9 ===
+void DIR_Init(void) {
+    RCC->AHBENR |= 0x00080000;	//Activamos el GPIOC. (6.4.6)
+    GPIOB->MODER |= 0x00050000;  // PC8 y PC9 como salida
+}
+
+// === Establecer dirección ===
+void set_motor_dir(int right_forward, int left_forward) {
+    if (right_forward) GPIOC->ODR |= (1 << 8);
+    else GPIOC->ODR &= ~(1 << 8);
+
+    if (left_forward) GPIOC->ODR |= (1 << 9);
+    else GPIOC->ODR &= ~(1 << 9);
+}
+
+// === Main ===
+int main(void) {
+    sensores_Init();	//Inicializa sensores
+    PWM_Init();		//Inicializa PWM para motores
+    DIR_Init();	//Inicializa pines de direccion
+
+    while (1) {
+    	// Leer error de posición respecto a la línea
+        int error = leerError();  // -300 (muy izq) a 300 (muy der)
+
+        // Control PID
+        error_integral += error;
+        int error_derivativo = error-error_anterior;
+        int ajuste = (int){
+        	Kp * error / 100.0 + ki * error_integral/100.0 + kd * error_derivativo/100
+        };
+
+        error_anterior = error;
+        int duty_r = VELOCIDAD_BASE - ajuste;	//PWM para motor derecho
+        int duty_l = VELOCIDAD_BASE + ajuste;	//PWM para motor izquierdo
+
+        // Límite para PWM entre 0 y ARR (1000)
+        if (duty_r < 0) duty_r = 0;
+        if (duty_r > 1000) duty_r = 1000;
+        if (duty_l < 0) duty_l = 0;
+        if (duty_l > 1000) duty_l = 1000;
+
+        // Aplicar dirección (siempre hacia adelante)
+        set_motor_dir(1, 1);
+
+        // Aplicar PWM
+        TIM3->CCR1 = duty_r;
+        TIM3->CCR2 = duty_l;
+
+        delay_ms(10);
+    }
+}
+ */
